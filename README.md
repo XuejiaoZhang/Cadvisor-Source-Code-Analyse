@@ -1,0 +1,281 @@
+# Cadvisor-Source-Code-Analyse
+Cadvisor Source Code Analyse (Collect data of machine and containers)
+
+实测流程createContainer ：
+manager/manager.go中
+----------------------------------
+Start（）-->
+//Createrootandthenrecoverallcontainers.
+err=self.createContainer("/",watcher.Raw)
+
+createContainer --> createContainerLocked -->
+一、NewContainerHandler -->
+
+	container/factory.go中
+	---------------------------------
+	1） -->CanHandleAndAccept -->
+	2） 如果1）中返回true
+		--> NewContainerHandler -->
+	
+	---------------------------------
+		具体实现：
+		container/docker/factory.go中
+		---------------------------------
+		1）-->CanHandleAndAccept --> ContainerInspect --> GET docker API /containers/<docker id>/json   返回数据的State.Running值
+		eg:
+		
+		
+		2）如果1）中返回true
+		--> NewContainerHandler --> 返回 handler
+		---------------------------------
+		
+二、NewCollectorManager--> 返回 GenericCollectorManager
+三、newContainerData
+	manager/manager.go中
+	---------------------------------
+	newContainerData --> 返回containerData
+					   返回ContainerReference
+						enableLoadReader
+						updateSpec （-->GetSpec）
+						summary.New（summary/summary.go   返回StatsSummary实例）
+	
+	----------------------------------
+四、//Addcollectors
+	Collector/collector_manager.go
+	-----------------------------------------------
+	GetCollectorConfigs 
+		labels含有前缀io.cadvisor.metric. 返回collectorConfigs
+	-----------------------------------------------
+	registerCollectors 
+		读取collectorConfigs，
+		1）前缀含有prometheus NewPrometheusCollector，返回PrometheusCollector对象
+		2）collectorManager.RegisterCollector --> NewCollector 返回GenericCollector对象
+五、GetSpec
+六、 AddEvent
+七、//Startthecontainer'shousekeeping.
+	cont.Start()  --> go c.housekeeping()
+	manager/container.go中
+	---------------------------------
+	Housekeeping --> 
+		//Start  any  background  goroutines-must  be  cleaned  up  in  c.handler.Cleanup().
+		1) c.handler.Start()
+		2) //Initialize   cpu  load  reader-must  be  cleaned  up  in  c.loadReader.Stop()
+		err:=c.loadReader.Start()
+	3）/Long  housekeeping  is  either  100ms  or  half  of  the  housekeeping  interval.
+	4） //Housekeep   every   second.
+		c.housekeepingTick() -- >  err:=c.updateStats()
+			a) stats,statsErr:=c.handler.GetStats()
+			------------------------
+			container/docker/handler.go 中 GetStats ，返回stats.这部分下面专门有详细过程
+		b）loadStats,err:=c.loadReader.GetCpuLoad(c.info.Name,path)
+				github.com\google\cadvisor\utils\cpuload\netlink\reader.go
+				---------------------------------------------------------------------------
+				GetCpuLoad --> getLoadStats  --> parseLoadStatsResp (syscall.NetlinkMessage 调用netlink socket，关于netlink有待进一步了解)
+				---------------------------------------------------------------
+			stats.TaskStats=loadStats
+			 
+		c）c.summaryReader.AddSample(*stats)
+		
+		d）更新自定义监控数据
+			cm:=c.collectorManager.(*collector.GenericCollectorManager)
+			customStats,err:=c.updateCustomStats()
+				github.com\google\cadvisor\collector\collector_manager.go
+				----------------------------
+				Collect --> c.collector.Collect(metrics)
+					分两种
+					1. 通用的collector
+					github.com\google\cadvisor\collector\generic_collector.go
+					----------------------------
+					Collect -->  URL of the endpoint 获取再格式化数据
+					
+					2. prometheus 的collector
+					github.com\google\cadvisor\collector\prometheus_collector.go
+					------------------------------------------------
+					Collect -->  URL of the endpoint 获取再格式化数据
+					
+		e）写入内存
+		        c.memoryCache.AddStats(ref,stats)
+				
+	5）//Log  usage  if  asked  to  do  so.
+	6）//Schedule   the  next  housekeeping.Sleep  until  that  time.
+
+
+实测流程detectSubcontainers
+manager/manager.go中detectSubcontainers
+一、getContainersDiff -- >ListContainers
+	container/docker/hander.go
+	--------------------------------------
+	ListContainers    return[]info.ContainerReference{}
+	-------------------------------
+二、 //Addthenewcontainers.
+	createContainer
+三、//Removetheoldcontainers.
+	destroyContainer
+
+
+//Gets summary  stats  for  all  containers  based  on  request  options.
+GetDerivedStats(containerNamestring,optionsv2.RequestOptions)(map[string]v2.DerivedStats,error)
+实测流程：
+manager/manager.go中 GetDerivedStats
+一、getRequestedContainers
+	按 Tv2.ypeName “name” : --> 不递归getDockerContainer 
+							递归 getSubcontainers
+	按 v2.TypeDocker“docker”: 不递归getDockerContainer 
+							递归 getAllDockerContainers
+							
+二、DerivedStats
+	manager/container.go
+	--------------------------------
+	DerivedStats --> c.summaryReader.DerivedStats
+	--------------------------
+		Summary/summary.go
+		----------------------------------------
+		DerivedStats -- >StatsSummary.derivedStat 
+		----------------------------------
+
+
+//informationaboutacontainer.
+GetContainerInfo(containerNamestring,query*info.ContainerInfoRequest)(*info.ContainerInfo,error)
+实测流程：
+manager/manager.go中GetContainerInfo
+一、getContainerData
+	manager.containers[namespacedContainerName{Name:containerName,}]
+	
+二、containerDataToContainerInfo
+	1. GetInfo -- >
+	manager/container.go
+	--------------------------
+	上次更新时间是不是大于5s
+	1) updateSpec(-->GetSpec)
+	2）updateSubcontainers
+	2. manager.memoryCache.RecentStats 从内存copy一份
+	3. 返回 info.ContainerInfo
+
+
+//Gets information about a specific Docker container.The specified name is within the Docker namespace.
+DockerContainer(dockerNamestring,query*info.ContainerInfoRequest)(info.ContainerInfo,error)
+实测流程：
+manager/manager.go中DockerContainer
+一、getDockerContainer
+//Check for the container in the Docker container  namespace.
+cont,ok:=self.containers[namespacedContainerName{
+	Namespace:docker.DockerNamespace,
+	Name:containerName,
+}]
+二、containerDataToContainerInfo 同上
+
+
+//Gets  spec for all containers basedon  request  options.
+GetContainerSpec(containerNamestring,optionsv2.RequestOptions)(map[string]v2.ContainerSpec,error)
+manager/manager.go中GetContainerSpec
+一、getRequestedContainers  同上
+二、GetInfo同上
+三、getV2Spec
+	manager/container.go
+	-------------------------
+	getV2Spec --> getAdjustedSpec -->ContainerSpecFromV1
+	-------------------------
+
+//Get info for all requested containers based on the request options.
+GetRequestedContainersInfo(containerNamestring,optionsv2.RequestOptions)(map[string]*info.ContainerInfo,error)
+manager/manager.go 中 GetRequestedContainersInfo
+一、getRequestedContainers  同上
+二、containerDataToContainerInfo同上
+
+
+
+
+获取容器状态，就是读文件而已。我们举一个已经在docker运行的容器来说：
+ cat /run/docker/execdriver/native/$containerID/state.json
+这里面记录了一个cgroup_paths字段，他的值是一个路径，通过cstats, err := mgr.GetStats()程序才真正拿到了监控数据，如cpu的状态信息，存储在一个如下的路径中（注意这个路径随环境不同而不同）：
+cd /sys/fs/cgroup/cpu,cpuacct/system.slice/docker-9b479ceaf3bef1caee2c37dfdc982a968144700a2c42991b238b938788a8a91f.scope
+
+源文档 <https://segmentfault.com/a/1190000003898140> 
+
+
+//Returns  the  current  stats  values of   the  container.
+GetStats()(*info.ContainerStats,error)
+container/container.go中GetStats
+一、container/docker/handler.go
+	-----------------------------
+	GetStats --> containerlibcontainer.GetStats
+	-----------------------
+		container/libcontainer/helpers.go
+		--------------------------------
+		//Get  cgroup and networking stats of the specified container
+		GetStats 
+			1) cgroupManager.GetStats()
+			github.com\opencontainers\runc\libcontainer\cgroups\systemd\apply_systemd.go
+			----------------------------------
+			 GetStats 
+				a) NewStats
+					github.com\opencontainers\runc\libcontainer\cgroups\stats.go
+					----------------------------------------
+					NewStats 新建stats对象
+					------------
+				b) sys,err:=subsystems.Get(name)
+				sys.GetStats(path,stats)
+				其中Var subsystems=subsystemSet{
+				&fs.CpusetGroup{},
+				&fs.DevicesGroup{},
+					…….
+				}
+				先按名称取cgroup每个子系统，然后调用对应子系统的GetStats方法。
+				例如 cpu子系统
+					github.com\opencontainers\runc\libcontainer\cgroups\fs\cpu.go
+					----------------------------
+					GetStats -- > 读取文件/sys/fs/cgroup/cpu/docker/<docker id>/cpu.stat 
+					例如：
+					
+				其他子系统，以此类推。返回cgroups Stats
+		2）newContainerStats  从上面cgroups Stats中拿数据新建 ContainerStats
+		3）// get  network  stats  from     /proc/<pid>/net/dev
+			networkStatsFromProc  读文件rootFs+ /proc/pid/net/dev得到NetworkStats
+			tcpStatsFromProc 读文件 rootFs+ /proc/pid/net/tcp rootFs+ /proc/pid/net/tcp6 得到TcpStat
+		4）
+二、
+//Clean  up   stats  for  containers  that  don't  have  their  own   network-this
+//includes  containers  running  in  Kubernetes  pods  that  use  the  network  of  the
+//infrastructure  container.This  stops  metrics  being  reported  multiple  times
+//for  each  container in  a  pod.
+if!self.needNet(){
+stats.Network=info.NetworkStats{}
+}
+
+三、
+//Get  file   systems  tats.
+manager.getFsStats(stats)
+从MachineInfo.Filesystems取，从dockerContainerHandler.realFsHandler取，dockerContainerHandler 待确认
+
+
+/usr/lib/systemd/system/machine.slice
+/sys/fs/cgroup/systemd/
+/sys/fs/cgroup/systemd/system.slice
+/sys/fs/cgroup/systemd/user.slice
+
+
+WEB  页面对应的源码
+cadvisor很多数据取得都是累计值，而cadvisor绘图有/s这样的率的结果，是因为在js中做了处理，（本次-上次）/时间间隔
+详细可参见：github.com\google\cadvisor\pages\assets\js\containers.js
+
+整个服务器监控信息：
+	首页也即http://172.28.80.15:8080/containers/  页面：
+	github.com\google\cadvisor\pages\container.go 中的serveContainersPage函数响应
+		GetContainerInfo  //information   about  a  container.
+具体某个容器监控信息：
+	形如http://172.28.80.15:8080/docker/<docker id>
+	eg：http://172.28.80.15:8080/docker/f917da66499c505604d20e30ca784b028a3846953d08882569df209cf54d821b
+	github.com\google\cadvisor\pages\docker.go 中的serveDockerPage函数响应
+		DockerContainer //Gets  information  about  a  specific  Docker  container.
+		AllDockerContainers //Gets  all  the   Docker  containers.
+		
+	
+globalHousekeeping函数//Look   for  new  containers  in  the  main  housekeeping  thread.
+	//Long  housekeeping  is  either  100ms  or  half  of  the  housekeeping  interval.
+	longHousekeeping:=100*time.Millisecond
+	if*globalHousekeepingInterval/2<longHousekeeping{
+		longHousekeeping=*globalHousekeepingInterval/2
+	} 其中globalHousekeepingInterval默认设置为1min
+	longHousekeeping小于等于100ms
+	Long  housekeeping  用于检测是否有容器变化
+	
